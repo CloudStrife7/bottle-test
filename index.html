@@ -1,0 +1,195 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>bottle test</title>
+<style>
+  :root { color-scheme: dark; --bg:#1b1b1b; --fg:#ddd; --mut:#888; --acc:#f4511e; }
+  body { margin:0; padding:14px; background:var(--bg); color:var(--fg); font:14px/1.45 ui-monospace,Menlo,Consolas,monospace; }
+  * { box-sizing:border-box; }
+  body, .card, .mut, label { overflow-wrap:anywhere; }
+  h1 { font-size:16px; margin:0 0 2px; font-weight:600; }
+  .mut { color:var(--mut); }
+  button { background:var(--acc); color:#fff; border:0; border-radius:6px; padding:12px 14px; font:inherit; margin:4px 4px 4px 0; }
+  button.alt { background:#333; }
+  button:disabled { opacity:.4; }
+  label { display:block; margin:6px 0; }
+  .card { border:1px solid #333; border-radius:8px; padding:10px; margin:10px 0; }
+  .ok { color:#6c6; } .bad { color:#f66; }
+  #log { white-space:pre-wrap; word-break:break-all; font-size:12px; max-height:55vh; overflow:auto; }
+</style>
+</head>
+<body>
+<h1>bottle test</h1>
+<div class="mut">Reads a Hidrate Spark over Bluetooth. Reads only; it sends nothing unless you press a button below.</div>
+
+<div class="card" id="caps"></div>
+
+<div class="card">
+  <label><input type="checkbox" id="all"> show all Bluetooth devices (use if the bottle is not listed)</label>
+  <button id="connect">1. Connect to bottle</button>
+  <button id="ack" class="alt" disabled>Send 0x57 (ack one sip)</button>
+  <button id="hand" class="alt" disabled>Send modern handshake</button>
+  <button id="copy" class="alt">Copy log</button>
+</div>
+
+<div class="card">
+  <div>Remembered bottles (needs the permissions flag):</div>
+  <div id="known" class="mut">none yet</div>
+  <button id="auto" class="alt">2. Reconnect with no tap</button>
+</div>
+
+<div class="card"><div id="log"></div></div>
+
+<script>
+const SVC_USER = "bf2d1ba0-c473-49f2-9571-0ce69036c642";
+const SVC_REF  = "45855422-6565-4cd7-a2a9-fe8af41b85e8";
+const C = {
+  userData: "bf2d1ba1-c473-49f2-9571-0ce69036c642",
+  setPoint: "b44b03f0-b850-4090-86eb-72863fb3618d",
+  debug:    "e3578b0d-caa7-46d6-b7c2-7331c08de044",
+  dataPoint:"016e11b1-6c8a-4074-9e5a-076053f93784",
+  weight:   "1807a063-4e2d-4636-981a-35e93d1c7b94",
+};
+const HANDSHAKE = [["debug","2100d1"],["setPoint","92"],["debug","2200f7"],
+  ["setPoint","7700000032d70000"],["setPoint","00341b00e0790000"],["setPoint","02345200c0a80000"],
+  ["setPoint","03346e0030c00000"],["setPoint","04348900a0d70000"],["setPoint","0534a50010ef0000"],
+  ["setPoint","0634c00080060100"],["setPoint","0734dc00f01d0100"],["setPoint","0834000000000000"],
+  ["setPoint","0934000000000000"]];
+const OPTIONAL = [SVC_USER, SVC_REF, "battery_service", "device_information", "generic_access"];
+
+const $ = id => document.getElementById(id);
+const logEl = $("log");
+let dev = null, chars = {};
+const t0 = Date.now();
+function log(msg, cls) {
+  const s = ((Date.now()-t0)/1000).toFixed(1).padStart(6);
+  const d = document.createElement("div");
+  if (cls) d.className = cls;
+  d.textContent = s + "  " + msg;
+  logEl.appendChild(d); logEl.scrollTop = logEl.scrollHeight;
+}
+const hex = dv => [...new Uint8Array(dv.buffer, dv.byteOffset, dv.byteLength)].map(b=>b.toString(16).padStart(2,"0")).join("");
+const unhex = h => new Uint8Array(h.match(/../g).map(x=>parseInt(x,16)));
+
+// What this browser can do.
+const bt = navigator.bluetooth;
+const yes = t => '<span class="ok">' + t + '</span>', no = t => '<span class="bad">' + t + '</span>';
+$("caps").innerHTML =
+  "browser: " + (navigator.userAgent.match(/(Chrome|Brave|Chromium)\/[\d.]+/g) || []).join(" ") + "<br>" +
+  "Web Bluetooth: " + (bt ? yes("yes") : no("NO - use Chrome, or turn the flag on")) + "<br>" +
+  "remember devices (getDevices): " + (bt && bt.getDevices ? yes("yes") : no("no")) + "<br>" +
+  "no-tap connect (watchAdvertisements): " + (window.BluetoothDevice && BluetoothDevice.prototype.watchAdvertisements ? yes("yes") : no("no")) + "<br>" +
+  "secure page (https): " + (isSecureContext ? yes("yes") : no("no"));
+
+function parseSip(dv) {
+  if (dv.byteLength < 4) return "short frame (" + dv.byteLength + " bytes)";
+  const left = dv.getUint8(0), pct = dv.getUint8(1), total = dv.getUint16(2, true);
+  let s = "pending=" + left + "  sip=" + pct + "% of bottle  running total=" + total + "%";
+  if (dv.byteLength >= 16) s += "  weight " + dv.getUint16(12,true) + " -> " + dv.getUint16(14,true);
+  return s;
+}
+
+async function setup(d) {
+  dev = d;
+  log("device: name=" + JSON.stringify(d.name) + " id=" + d.id);
+  d.addEventListener("gattserverdisconnected", () => { log("bottle disconnected", "bad"); $("ack").disabled = $("hand").disabled = true; });
+  log("connecting...");
+  const server = await d.gatt.connect();
+  log("connected", "ok");
+  const services = await server.getPrimaryServices();
+  log("services found: " + services.length + (services.length ? "" : " (none: the bottle uses a service I did not list)"), services.length ? "ok" : "bad");
+  chars = {};
+  for (const s of services) {
+    log("SERVICE " + s.uuid);
+    let cs = [];
+    try { cs = await s.getCharacteristics(); } catch (e) { log("  cannot list characteristics: " + e.message, "bad"); }
+    for (const c of cs) {
+      const p = Object.entries({read:c.properties.read, write:c.properties.write, wnr:c.properties.writeWithoutResponse, notify:c.properties.notify, indicate:c.properties.indicate}).filter(([,v])=>v).map(([k])=>k).join(",");
+      log("  char " + c.uuid + " [" + p + "]");
+      chars[c.uuid] = c;
+    }
+  }
+  // Plain reads
+  const reads = {"00002a19-0000-1000-8000-00805f9b34fb":"battery %", "00002a24-0000-1000-8000-00805f9b34fb":"model", "00002a26-0000-1000-8000-00805f9b34fb":"firmware", "00002a27-0000-1000-8000-00805f9b34fb":"hardware", "00002a29-0000-1000-8000-00805f9b34fb":"maker"};
+  for (const [u,label] of Object.entries(reads)) {
+    const c = chars[u]; if (!c) continue;
+    try {
+      const v = await c.readValue();
+      log(label + ": " + (label === "battery %" ? v.getUint8(0) : new TextDecoder().decode(v)), "ok");
+    } catch (e) { log(label + ": read failed: " + e.message, "bad"); }
+  }
+  // Sip data: try both characteristics, only listen (no writes).
+  for (const [name,u] of [["legacy data point",C.dataPoint],["modern user data",C.userData]]) {
+    const c = chars[u]; if (!c) { log(name + ": not on this bottle"); continue; }
+    try {
+      c.addEventListener("characteristicvaluechanged", e => log("SIP FRAME [" + name + "] " + hex(e.target.value) + "  =>  " + parseSip(e.target.value), "ok"));
+      await c.startNotifications();
+      log(name + ": listening", "ok");
+      if (c.properties.read) { try { const v = await c.readValue(); log("READ [" + name + "] " + hex(v) + "  =>  " + parseSip(v), "ok"); } catch (e) { log(name + " read failed: " + e.message); } }
+    } catch (e) { log(name + ": listen failed: " + e.message, "bad"); }
+  }
+  $("ack").disabled = $("hand").disabled = false;
+  log("done. Now take a sip and watch for SIP FRAME lines.", "ok");
+}
+
+$("connect").onclick = async () => {
+  try {
+    if (!bt) throw new Error("this browser has no Web Bluetooth");
+    const opts = $("all").checked ? {acceptAllDevices:true, optionalServices:OPTIONAL}
+                                  : {filters:[{namePrefix:"h2o"},{services:[SVC_USER]},{services:[SVC_REF]}], optionalServices:OPTIONAL};
+    log("opening the picker...");
+    await setup(await bt.requestDevice(opts));
+    listKnown();
+  } catch (e) { log("ERROR: " + e.name + ": " + e.message, "bad"); }
+};
+
+$("ack").onclick = async () => {
+  const c = chars[C.dataPoint] || chars[C.userData];
+  if (!c) return log("no data characteristic", "bad");
+  try { await c.writeValueWithResponse(Uint8Array.of(0x57)); log("sent 0x57 to " + c.uuid, "ok"); }
+  catch (e) { log("write failed: " + e.message, "bad"); }
+};
+
+$("hand").onclick = async () => {
+  try {
+    for (const [k,h] of HANDSHAKE) {
+      const c = chars[C[k]]; if (!c) { log("handshake: " + k + " missing, skipped"); continue; }
+      await c.writeValueWithResponse(unhex(h)); await new Promise(r => setTimeout(r, 50));
+    }
+    log("handshake sent", "ok");
+  } catch (e) { log("handshake failed: " + e.message, "bad"); }
+};
+
+async function listKnown() {
+  if (!bt || !bt.getDevices) { $("known").textContent = "this browser cannot remember devices"; return; }
+  try {
+    const ds = await bt.getDevices();
+    $("known").textContent = ds.length ? ds.map(d => d.name || d.id).join(", ") : "none yet (connect once first)";
+    return ds;
+  } catch (e) { $("known").textContent = "error: " + e.message; }
+}
+
+$("auto").onclick = async () => {
+  try {
+    const ds = await listKnown();
+    if (!ds || !ds.length) return log("no remembered bottle. Press Connect first, then reload this page.", "bad");
+    const d = ds[0];
+    if (!d.watchAdvertisements) return log("watchAdvertisements missing", "bad");
+    log("waiting for " + (d.name || d.id) + " to be seen (wake the bottle)...");
+    d.addEventListener("advertisementreceived", async () => {
+      if (d.gatt.connected) return;
+      log("bottle seen, connecting with NO tap", "ok");
+      try { await setup(d); } catch (e) { log("ERROR: " + e.message, "bad"); }
+    }, {once:true});
+    await d.watchAdvertisements();
+  } catch (e) { log("ERROR: " + e.name + ": " + e.message, "bad"); }
+};
+
+$("copy").onclick = () => navigator.clipboard.writeText(logEl.innerText).then(() => log("log copied"), e => log("copy failed: " + e.message));
+listKnown();
+log("ready. Tap 1. Connect to bottle.");
+</script>
+</body>
+</html>
